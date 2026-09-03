@@ -386,3 +386,57 @@ class TestRepoRangeIsSatisfiable:
             + "\n"
         )
         assert required_npm_range(synthetic) == npm_range
+
+
+class TestCliShim:
+    """``python -m hermes_cli.npm_engine`` — the bridge scripts/install.sh uses
+    so the installer re-run gets the same repair ``hermes update`` calls
+    in-process. Contract: stdin is the failed command's output, stdout is the
+    one npm path to retry with, exit 0 == retry / exit 1 == give up."""
+
+    def _run(self, monkeypatch, capsys, stdin_text, repaired):
+        import io
+
+        calls = []
+
+        def fake_repair(npm, output, *, quiet=False):
+            calls.append((npm, output, quiet))
+            return repaired
+
+        monkeypatch.setattr(npm_engine, "maybe_repair_npm_engine", fake_repair)
+        monkeypatch.setattr("sys.stdin", io.StringIO(stdin_text))
+        code = npm_engine.main(["--npm", "/usr/bin/npm", "--quiet"])
+        return code, capsys.readouterr(), calls
+
+    def test_successful_repair_prints_path_and_exits_zero(self, monkeypatch, capsys):
+        code, captured, calls = self._run(
+            monkeypatch, capsys, EBADENGINE_OUTPUT, "/managed/node/bin/npm"
+        )
+        assert code == 0
+        assert captured.out.strip() == "/managed/node/bin/npm"
+        assert calls == [("/usr/bin/npm", EBADENGINE_OUTPUT, True)]
+
+    def test_no_repair_exits_one_and_prints_nothing_on_stdout(
+        self, monkeypatch, capsys
+    ):
+        code, captured, _ = self._run(
+            monkeypatch, capsys, "npm error ENOENT missing file\n", None
+        )
+        assert code == 1
+        assert captured.out.strip() == ""
+
+    def test_progress_chatter_is_kept_off_stdout(self, monkeypatch, capsys):
+        def chatty_repair(npm, output, *, quiet=False):
+            print("→ provisioning a managed runtime…")
+            return "/managed/node/bin/npm"
+
+        import io
+
+        monkeypatch.setattr(npm_engine, "maybe_repair_npm_engine", chatty_repair)
+        monkeypatch.setattr("sys.stdin", io.StringIO(EBADENGINE_OUTPUT))
+        code = npm_engine.main(["--npm", "/usr/bin/npm"])
+        captured = capsys.readouterr()
+        assert code == 0
+        # only the retry path reaches stdout; the chatter is diverted to stderr
+        assert captured.out.strip() == "/managed/node/bin/npm"
+        assert "provisioning" in captured.err

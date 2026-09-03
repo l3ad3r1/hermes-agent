@@ -47,6 +47,7 @@ __all__ = [
     "managed_npm_prefix",
     "upgrade_managed_npm",
     "maybe_repair_npm_engine",
+    "main",
 ]
 
 # npm prints `npm error notsup Required: {...}` on npm >= 10 and
@@ -352,3 +353,50 @@ def maybe_repair_npm_engine(
     if not quiet and npm_range:
         _print_manual_fix(npm, npm_range, actual_npm_version(output))
     return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI shim so the shell installer gets the same repair ``hermes update`` has.
+
+    ``hermes update`` calls :func:`maybe_repair_npm_engine` in-process after a
+    failed ``npm install`` (see ``hermes_cli/main.py``). The installer re-run
+    path in ``scripts/install.sh`` is shell and needs the same rung: read the
+    failed command's combined output on stdin, attempt one repair, and on
+    success print the npm executable to retry with. Exit 0 with a path on
+    stdout means "retry the install with this npm"; exit 1 means "no repair
+    applied — let the original failure stand".
+    """
+    import argparse
+    import contextlib
+
+    parser = argparse.ArgumentParser(
+        prog="python -m hermes_cli.npm_engine",
+        description=(
+            "Attempt one npm EBADENGINE repair and print the npm to retry with."
+        ),
+    )
+    parser.add_argument(
+        "--npm",
+        required=True,
+        help="the npm executable whose install just failed",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="suppress progress chatter (errors still go to stderr)",
+    )
+    args = parser.parse_args(argv)
+
+    output = sys.stdin.read()
+    # Keep stdout clean for the one line the caller parses — a repair can
+    # otherwise print provisioning progress there.
+    with contextlib.redirect_stdout(sys.stderr):
+        repaired = maybe_repair_npm_engine(args.npm, output, quiet=args.quiet)
+    if not repaired:
+        return 1
+    print(repaired)
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised via subprocess
+    raise SystemExit(main())

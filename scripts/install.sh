@@ -2649,6 +2649,43 @@ node_deps_workspace_args() {
     NODE_DEPS_WORKSPACE_ARGS+=(--include-workspace-root)
 }
 
+# One npm EBADENGINE repair attempt, bridging to the same
+# hermes_cli.npm_engine recovery that `hermes update` runs in-process
+# (hermes_cli/main.py). An npm outside the root package.json's engines.npm
+# range fails every `npm install` in the checkout before doing any work;
+# #85297 made that fatal, but only the updater got a recovery rung, so a
+# re-run of this installer stranded the user on a raw EBADENGINE.
+#
+# Reads the failed install's captured output ($1), and on a successful
+# repair echoes the npm executable to retry with. Prints nothing when the
+# failure is not an engine mismatch or no repair is possible. Best-effort:
+# every failure path here is a silent no-op that leaves the original npm
+# error to stand.
+repair_npm_engine_from_log() {
+    local npm_log="$1"
+    local py="" npm_bin=""
+
+    # Cheap gate: only npm's own engine check is repairable this way. Skip the
+    # Python fork for every other failure (a real dependency error, a stalled
+    # fetch, a lockfile conflict).
+    grep -qE "EBADENGINE|Unsupported engine" "$npm_log" 2>/dev/null || return 0
+
+    if [ "$USE_VENV" = true ] && [ -x "$INSTALL_DIR/venv/bin/python" ]; then
+        py="$INSTALL_DIR/venv/bin/python"
+    else
+        py="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+    fi
+    [ -n "$py" ] || return 0
+
+    npm_bin="$(command -v npm 2>/dev/null || true)"
+    [ -n "$npm_bin" ] || return 0
+
+    ( cd "$INSTALL_DIR" 2>/dev/null \
+        && "$py" -m hermes_cli.npm_engine --npm "$npm_bin" --quiet < "$npm_log" ) \
+        2>/dev/null || return 0
+    return 0
+}
+
 install_node_deps() {
     if [ "$HAS_NODE" = false ]; then
         log_info "Skipping Node.js dependencies (Node not installed)"
@@ -2676,16 +2713,28 @@ install_node_deps() {
         node_deps_workspace_args "$INSTALL_DIR"
         local npm_log
         npm_log="$(mktemp)"
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install "${NODE_DEPS_WORKSPACE_ARGS[@]}" --silent \
-                >"$npm_log" 2>&1; then
-            log_error "npm install failed or timed out; Node.js dependencies were not installed"
-            if [ -s "$npm_log" ]; then
-                log_error "npm output:"
-                cat "$npm_log" >&2
+        # --loglevel=error, not --silent: a clean install stays quiet, but
+        # npm's own error text still reaches $npm_log so a failure here is
+        # diagnosable. #87340 added the capture; --silent was emptying it,
+        # leaving "npm install failed" with nothing after it.
+        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install "${NODE_DEPS_WORKSPACE_ARGS[@]}" \
+                --loglevel=error --no-fund --no-audit >"$npm_log" 2>&1; then
+            # An npm outside engines.npm fails before doing any work; give the
+            # installer re-run the one repair+retry `hermes update` already has.
+            local repaired_npm=""
+            repaired_npm="$(repair_npm_engine_from_log "$npm_log" || true)"
+            if [ -z "$repaired_npm" ] || ! run_with_timeout "$NODE_DEPS_TIMEOUT" \
+                    "$repaired_npm" install "${NODE_DEPS_WORKSPACE_ARGS[@]}" \
+                    --loglevel=error --no-fund --no-audit >"$npm_log" 2>&1; then
+                log_error "npm install failed or timed out; Node.js dependencies were not installed"
+                if [ -s "$npm_log" ]; then
+                    log_error "npm output:"
+                    cat "$npm_log" >&2
+                fi
+                rm -f "$npm_log"
+                restore_dirty_lockfiles "$INSTALL_DIR"
+                return 1
             fi
-            rm -f "$npm_log"
-            restore_dirty_lockfiles "$INSTALL_DIR"
-            return 1
         fi
         rm -f "$npm_log"
         log_success "Node.js dependencies installed"
@@ -2792,16 +2841,23 @@ install_node_deps() {
         # Capture npm output so failures are diagnosable (#87340).
         local tui_npm_log
         tui_npm_log="$(mktemp)"
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent \
-                >"$tui_npm_log" 2>&1; then
-            log_error "TUI npm install failed or timed out; TUI dependencies were not installed"
-            if [ -s "$tui_npm_log" ]; then
-                log_error "npm output:"
-                cat "$tui_npm_log" >&2
+        # --loglevel=error, not --silent — see install_node_deps above.
+        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install \
+                --loglevel=error --no-fund --no-audit >"$tui_npm_log" 2>&1; then
+            local tui_repaired_npm=""
+            tui_repaired_npm="$(repair_npm_engine_from_log "$tui_npm_log" || true)"
+            if [ -z "$tui_repaired_npm" ] || ! run_with_timeout "$NODE_DEPS_TIMEOUT" \
+                    "$tui_repaired_npm" install \
+                    --loglevel=error --no-fund --no-audit >"$tui_npm_log" 2>&1; then
+                log_error "TUI npm install failed or timed out; TUI dependencies were not installed"
+                if [ -s "$tui_npm_log" ]; then
+                    log_error "npm output:"
+                    cat "$tui_npm_log" >&2
+                fi
+                rm -f "$tui_npm_log"
+                restore_dirty_lockfiles "$INSTALL_DIR"
+                return 1
             fi
-            rm -f "$tui_npm_log"
-            restore_dirty_lockfiles "$INSTALL_DIR"
-            return 1
         fi
         rm -f "$tui_npm_log"
         log_success "TUI dependencies installed"
